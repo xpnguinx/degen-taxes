@@ -1,0 +1,32 @@
+# Sensitive data
+.env
+.env.*
+*.env
+
+# Database files (contain wallet addresses + tx history)
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local data
+wallets/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# PHP
+vendor/
+composer.lock
+
+# Logs
+*.log
+php_errors.log
