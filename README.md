@@ -1,6 +1,6 @@
 # 🔥 DEGEN-TAXES
 <img width="1169" height="683" alt="Screenshot 2026-03-21 at 4 19 20 PM" src="https://github.com/user-attachments/assets/144b5c64-351f-4354-b50d-26f7cbb702e2" />
-<img width="1229" height="654" alt="Screenshot 2026-03-21 at 4 27 31 PM" src="https://github.com/user-attachments/assets/206f74cc-103b-44d3-afff-86c42572b37e" />
+
 
 > **Solana meme coin tax tracker for degens who actually want to stay out of jail.**
 
