@@ -413,56 +413,96 @@ function taxTreatmentOptions(): array
 
 // --- Flow Analysis Functions ---
 
-function getFlowAnalysis(array $wallets): array
+function getAvailableYears(): array
+{
+    $result = db()->query('SELECT DISTINCT strftime(\'%Y\', block_time, \'unixepoch\', \'localtime\') AS yr FROM transactions WHERE block_time > 0 ORDER BY yr DESC');
+    $years = [];
+    while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+        if (!empty($row['yr'])) $years[] = (int)$row['yr'];
+    }
+    return $years;
+}
+
+function getFlowAnalysis(array $wallets, ?int $year = null): array
 {
     $addressMap = [];
     foreach ($wallets as $w) $addressMap[strtolower($w['address'])] = $w['label'];
     $allAddresses = array_keys($addressMap);
 
+    // Build year filter for SQL queries
+    $yearFilter = '';
+    $yearStart = 0; $yearEnd = 0;
+    if ($year !== null) {
+        $tz = date_default_timezone_get();
+        $yearStart = (new DateTimeImmutable("$year-01-01 00:00:00", new DateTimeZone($tz)))->getTimestamp();
+        $yearEnd = (new DateTimeImmutable(($year + 1) . "-01-01 00:00:00", new DateTimeZone($tz)))->getTimestamp();
+        $yearFilter = ' AND block_time >= ' . $yearStart . ' AND block_time < ' . $yearEnd;
+    }
+
     $selfTransfers = 0.0; $incomeTotal = 0.0; $disposalTotal = 0.0; $swapCount = 0;
+    $feesTotal = 0.0;
     $flows = []; $finalBalances = [];
 
     foreach ($wallets as $w) {
         $wid = (int)$w['id'];
         $addr = strtolower($w['address']);
         $netSol = 0.0;
-        $result = db()->prepare('SELECT * FROM tx_transfers WHERE transaction_id IN (SELECT id FROM transactions WHERE wallet_id=:wid)');
+
+        // Sum fees from transactions table (fee_lamports → SOL)
+        $feeStmt = db()->prepare('SELECT COALESCE(SUM(fee_lamports),0) AS total_fees FROM transactions WHERE wallet_id=:wid' . $yearFilter);
+        $feeStmt->bindValue(':wid', $wid, SQLITE3_INTEGER);
+        $feeRow = $feeStmt->execute()->fetchArray(SQLITE3_ASSOC);
+        $walletFees = ((float)($feeRow['total_fees'] ?? 0)) / 1e9;
+        $feesTotal += $walletFees;
+
+        $result = db()->prepare('SELECT * FROM tx_transfers WHERE transaction_id IN (SELECT id FROM transactions WHERE wallet_id=:wid' . $yearFilter . ')');
         $result->bindValue(':wid', $wid, SQLITE3_INTEGER);
         $rows = $result->execute();
         while ($row = $rows->fetchArray(SQLITE3_ASSOC)) {
             $from = strtolower((string)($row['from_account'] ?? ''));
             $to = strtolower((string)($row['to_account'] ?? ''));
             $amt = (float)($row['amount'] ?? 0);
-            $sym = (string)($row['symbol'] ?? $row['mint'] ?? 'SOL');
-            if ($row['direction'] === 'in') $netSol += $amt;
-            else $netSol -= $amt;
+            $kind = (string)($row['transfer_kind'] ?? '');
+            $isNativeSol = ($kind === 'native');
+
+            // Only count native SOL transfers for the SOL balance
+            if ($isNativeSol) {
+                if ($row['direction'] === 'in') $netSol += $amt;
+                else $netSol -= $amt;
+            }
+
+            // Flow aggregation — only native SOL
+            if (!$isNativeSol) continue;
 
             if ($row['direction'] === 'out' && in_array($to, $allAddresses, true)) {
-                $selfTransfers += ($sym === 'SOL') ? $amt : 0;
+                $selfTransfers += $amt;
                 $flowKey = $addr . '>' . $to;
                 if (!isset($flows[$flowKey])) $flows[$flowKey] = ['from'=>$addr,'to'=>$to,'sol'=>0,'tokens'=>[],'type'=>'self_transfer'];
-                $flows[$flowKey]['sol'] += ($sym === 'SOL') ? $amt : 0;
+                $flows[$flowKey]['sol'] += $amt;
             } elseif ($row['direction'] === 'in' && !in_array($from, $allAddresses, true)) {
-                $incomeTotal += ($sym === 'SOL') ? $amt : 0;
+                $incomeTotal += $amt;
                 $flowKey = $from . '>' . $addr;
                 if (!isset($flows[$flowKey])) $flows[$flowKey] = ['from'=>$from,'to'=>$addr,'sol'=>0,'tokens'=>[],'type'=>'income'];
-                $flows[$flowKey]['sol'] += ($sym === 'SOL') ? $amt : 0;
+                $flows[$flowKey]['sol'] += $amt;
             } elseif ($row['direction'] === 'out' && !in_array($to, $allAddresses, true)) {
-                $disposalTotal += ($sym === 'SOL') ? $amt : 0;
+                $disposalTotal += $amt;
                 $flowKey = $addr . '>' . $to;
                 if (!isset($flows[$flowKey])) $flows[$flowKey] = ['from'=>$addr,'to'=>$to,'sol'=>0,'tokens'=>[],'type'=>'disposal'];
-                $flows[$flowKey]['sol'] += ($sym === 'SOL') ? $amt : 0;
+                $flows[$flowKey]['sol'] += $amt;
             }
         }
         $finalBalances[$w['label']] = $netSol;
     }
-    $txResult = db()->query('SELECT COUNT(*) AS c FROM transactions WHERE inferred_category = "swap_or_complex"');
+    $swapSql = 'SELECT COUNT(*) AS c FROM transactions WHERE inferred_category = "swap_or_complex"' . $yearFilter;
+    $txResult = db()->query($swapSql);
     $swapRow = $txResult->fetchArray(SQLITE3_ASSOC);
     $swapCount = (int)($swapRow['c'] ?? 0);
     return [
         'self_transfers_sol' => round($selfTransfers, 4), 'income_sol' => round($incomeTotal, 4),
         'disposal_sol' => round($disposalTotal, 4), 'swap_count' => $swapCount,
+        'fees_sol' => round($feesTotal, 6),
         'flows' => array_values($flows), 'final_balances' => $finalBalances,
+        'year' => $year,
     ];
 }
 
@@ -484,9 +524,11 @@ function getFlowSankeyData(array $wallets, array $flowAnalysis): array
 
 function exportCsv(array $transactions, array $wallet): void
 {
-    header('Content-Type: text/csv; charset=utf-8');
-    header('Content-Disposition: attachment; filename="degen_' . preg_replace('/[^a-zA-Z0-9_-]+/', '_', $wallet['label']) . '_ledger.csv"');
-    $out = fopen('php://output', 'wb');
+    $dir = __DIR__ . '/wallets';
+    if (!is_dir($dir)) mkdir($dir, 0755, true);
+    $filename = 'degen_' . preg_replace('/[^a-zA-Z0-9_-]+/', '_', $wallet['label']) . '_ledger.csv';
+    $filepath = $dir . '/' . $filename;
+    $out = fopen($filepath, 'wb');
     fputcsv($out, ['wallet_label','wallet_address','date_local','signature','tx_type','source','description',
         'native_in_sol','native_out_sol','fee_sol','effective_category','tax_treatment',
         'usd_value_manual','basis_usd_manual','gain_loss_estimate_manual','notes'], ',', '"', '');
@@ -500,14 +542,16 @@ function exportCsv(array $transactions, array $wallet): void
             $tx['tax_treatment'],$usd,$basis,$gainLoss,$tx['notes']], ',', '"', '');
     }
     fclose($out);
-    exit;
+    serveFileDownload($filepath, $filename);
 }
 
 function exportTaxSummary(array $wallets, array $flowAnalysis): void
 {
-    header('Content-Type: text/csv; charset=utf-8');
-    header('Content-Disposition: attachment; filename="degen_tax_summary.csv"');
-    $out = fopen('php://output', 'wb');
+    $dir = __DIR__ . '/wallets';
+    if (!is_dir($dir)) mkdir($dir, 0755, true);
+    $filename = 'degen_tax_summary.csv';
+    $filepath = $dir . '/' . $filename;
+    $out = fopen($filepath, 'wb');
     fputcsv($out, ['tax_bucket','from_wallet','to_wallet','amount_sol','flow_type'], ',', '"', '');
     foreach ($flowAnalysis['flows'] as $flow) {
         $addressMap = [];
@@ -522,7 +566,22 @@ function exportTaxSummary(array $wallets, array $flowAnalysis): void
     fputcsv($out, ['income_sol', $flowAnalysis['income_sol']], ',', '"', '');
     fputcsv($out, ['disposal_sol', $flowAnalysis['disposal_sol']], ',', '"', '');
     fputcsv($out, ['swap_count', $flowAnalysis['swap_count']], ',', '"', '');
+    fputcsv($out, ['fees_sol', $flowAnalysis['fees_sol'] ?? 0], ',', '"', '');
     fclose($out);
+    serveFileDownload($filepath, $filename);
+}
+
+function serveFileDownload(string $filepath, string $filename): void
+{
+    if (ob_get_level()) ob_end_clean();
+    header('Content-Description: File Transfer');
+    header('Content-Type: text/csv; charset=utf-8');
+    header('Content-Disposition: attachment; filename="' . $filename . '"');
+    header('Content-Length: ' . filesize($filepath));
+    header('Cache-Control: must-revalidate');
+    header('Pragma: public');
+    flush();
+    readfile($filepath);
     exit;
 }
 
@@ -611,13 +670,15 @@ $currentTx = $currentTxId ? getTransactionById($currentTxId) : null;
 $filters = ['q' => trim((string)($_GET['q'] ?? '')), 'category' => trim((string)($_GET['category'] ?? ''))];
 $transactions = $currentWallet ? getTransactionsForWallet((int)$currentWallet['id'], $filters) : [];
 $stats = $currentWallet ? walletStats((int)$currentWallet['id']) : ['tx_count'=>0,'sol_in'=>0,'sol_out'=>0,'reviewed'=>0,'manual_usd_total'=>0];
-$flowAnalysis = ($view === 'flow' || $view === 'tax') && !empty($wallets) ? getFlowAnalysis($wallets) : null;
+$availableYears = getAvailableYears();
+$selectedYear = isset($_GET['year']) && $_GET['year'] !== '' ? (int)$_GET['year'] : null;
+$flowAnalysis = ($view === 'flow' || $view === 'tax') && !empty($wallets) ? getFlowAnalysis($wallets, $selectedYear) : null;
 $sankeyData = $flowAnalysis ? getFlowSankeyData($wallets, $flowAnalysis) : null;
 
 if (isset($_GET['export'])) {
     if ($_GET['export'] === 'csv' && $currentWallet) exportCsv($transactions, $currentWallet);
     if ($_GET['export'] === 'tax_summary' && !empty($wallets)) {
-        $fa = getFlowAnalysis($wallets);
+        $fa = getFlowAnalysis($wallets, $selectedYear);
         exportTaxSummary($wallets, $fa);
     }
 }
@@ -759,6 +820,9 @@ unset($_SESSION['flashes']);
         .tax-card .tc-label { color: var(--muted); font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; }
         .tax-card .tc-value { font-size: 28px; font-weight: 800; margin-top: 6px; }
         .tax-card .tc-sub { font-size: 12px; color: var(--muted); margin-top: 4px; }
+        .tax-card .tc-desc { font-size: 12px; color: var(--muted); margin-top: 10px; line-height: 1.55; text-align: left; padding-top: 10px; border-top: 1px solid var(--line); }
+        .tax-card .tc-desc strong { color: var(--text); }
+        .tax-card.fees::before { background: var(--muted); }
 
         .balance-list { display: grid; gap: 8px; }
         .balance-row { display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; background: rgba(16,16,28,0.5); border: 1px solid var(--line); border-radius: 12px; }
@@ -1099,10 +1163,21 @@ unset($_SESSION['flashes']);
     <div class="flow-container main" style="padding:20px;">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:10px;">
             <div>
-                <h2 style="margin:0;font-size:20px;">📊 tax summary dashboard</h2>
+                <h2 style="margin:0;font-size:20px;">📊 tax summary dashboard <?= $selectedYear ? '— ' . $selectedYear : '— all years' ?></h2>
                 <div class="sub">your transactions broken down by tax bucket</div>
             </div>
-            <a href="?export=tax_summary"><button class="btn-primary">📥 export tax summary CSV</button></a>
+            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                <form method="get" style="display:flex;gap:8px;align-items:center;">
+                    <input type="hidden" name="view" value="tax">
+                    <select name="year" onchange="this.form.submit()" style="width:auto;min-width:140px;">
+                        <option value="">📅 all years</option>
+                        <?php foreach ($availableYears as $yr): ?>
+                            <option value="<?= $yr ?>" <?= $selectedYear === $yr ? 'selected' : '' ?>>📅 <?= $yr ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </form>
+                <a href="?export=tax_summary<?= $selectedYear ? '&year=' . $selectedYear : '' ?>"><button class="btn-primary">📥 export tax summary CSV</button></a>
+            </div>
         </div>
 
         <?php if ($flowAnalysis): ?>
@@ -1112,24 +1187,35 @@ unset($_SESSION['flashes']);
                     <div class="tc-label">self-transfers</div>
                     <div class="tc-value" style="color:var(--green);"><?= rtrim(rtrim(number_format($flowAnalysis['self_transfers_sol'],4,'.',''),'0'),'.') ?> SOL</div>
                     <div class="tc-sub">wallet ↔ wallet — not taxed</div>
+                    <div class="tc-desc">SOL moved between your own wallets. This is <strong>not a taxable event</strong> — no gain or loss is realized. Make sure these are correctly identified so they don't inflate your taxable totals.</div>
                 </div>
                 <div class="tax-card income">
                     <div class="tc-icon">📥</div>
                     <div class="tc-label">income / claims</div>
                     <div class="tc-value" style="color:var(--yellow);"><?= rtrim(rtrim(number_format($flowAnalysis['income_sol'],4,'.',''),'0'),'.') ?> SOL</div>
                     <div class="tc-sub">ordinary income bracket</div>
+                    <div class="tc-desc">SOL received from external sources — airdrops, staking rewards, fee claims, mining. Taxed as <strong>ordinary income</strong> at your federal bracket (<strong>10–37%</strong>) based on fair market value at time of receipt.</div>
                 </div>
                 <div class="tax-card disposal">
                     <div class="tc-icon">📤</div>
                     <div class="tc-label">outflows / disposals</div>
                     <div class="tc-value" style="color:var(--red);"><?= rtrim(rtrim(number_format($flowAnalysis['disposal_sol'],4,'.',''),'0'),'.') ?> SOL</div>
                     <div class="tc-sub">capital gains events</div>
+                    <div class="tc-desc">SOL sent to external addresses — sales, payments, withdrawals. May trigger <strong>capital gains tax</strong>: short-term (held &lt;1yr) at <strong>10–37%</strong>, long-term (held &gt;1yr) at <strong>0–20%</strong>. Gain/loss = sale price − cost basis.</div>
                 </div>
                 <div class="tax-card swap">
                     <div class="tc-icon">🔀</div>
                     <div class="tc-label">swaps detected</div>
                     <div class="tc-value" style="color:var(--blue);"><?= number_format($flowAnalysis['swap_count']) ?></div>
                     <div class="tc-sub">taxable swap transactions</div>
+                    <div class="tc-desc">Token-for-token swaps on DEXs (e.g. SOL→BONK). Each swap is a <strong>disposal of the sold token + acquisition of the bought token</strong>. Capital gains rules apply to the disposed asset.</div>
+                </div>
+                <div class="tax-card fees">
+                    <div class="tc-icon">💸</div>
+                    <div class="tc-label">fees paid</div>
+                    <div class="tc-value" style="color:var(--muted);"><?= rtrim(rtrim(number_format($flowAnalysis['fees_sol'],6,'.',''),'0'),'.') ?> SOL</div>
+                    <div class="tc-sub">on-chain transaction fees</div>
+                    <div class="tc-desc">Total Solana network fees (gas) paid across all wallets. Generally <strong>added to cost basis</strong> of acquisitions or deductible as a trading expense. Track these — they reduce your taxable gain.</div>
                 </div>
             </div>
 
